@@ -1,0 +1,761 @@
+---
+title: ""
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+# GSE 524 Lab 9
+
+## Instructions
+
+You will submit an HTML document to Canvas as your final version.
+
+Your document should show your code chunks/cells as well as any output. Make sure that only relevant output is printed. Do not, for example, print the entire dataset in your final knitted file.
+
+Your document should also be clearly organized, so that it is easy for a reader to find your answers to each question.
+
+Libraries needed for this lab:
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(rpart.plot)
+library(discrim)
+library(baguette)
+library(janitor)
+library(ggplot2)
+library(ggcorrplot)
+library(keras)
+library(vip)
+```
+
+## Dataset 1: Mushrooms
+
+The first dataset we will study today concerns mushrooms that grow in the wild. An expert mushroom forager can identify the species by its appearance, and determine if the mushroom is edible or poisonous.
+
+Can we train a model to do the same?
+
+Read the data in as follows. (You do need the extra bit of code in the read_csv function, make sure you copy it over.)
+
+```{r}
+mushrooms <- read_csv("https://www.dropbox.com/s/jk5q3dq1u63ey1e/mushrooms.csv?dl=1",
+                      col_types = str_c(rep("c", 23), collapse = "")) 
+```
+
+You can find further documentation of the dataset here: https://www.kaggle.com/uciml/mushroom-classification
+
+### Part One: A perfect tree
+
+```{r}
+mushrooms <- mushrooms %>% 
+  mutate_if(sapply(mushrooms, is.character), as.factor) %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(-veil_type)
+```
+
+Fit a single decision tree to the full mushroom data, and plot the resulting tree.
+
+```{r}
+mushrooms_recipe <- recipe(class ~ ., 
+                     data = mushrooms)
+
+tree_mod <- decision_tree() %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+tree_wflow <- workflow() %>%
+  add_recipe(mushrooms_recipe) %>%
+  add_model(tree_mod)
+
+tree_fit <- tree_wflow %>%
+  fit(mushrooms)
+
+tree_fitted <- tree_fit %>% 
+  pull_workflow_fit()
+
+rpart.plot(tree_fitted$fit)
+```
+
+
+You should find that almost all mushrooms are perfectly classified; that is, the resulting leaf nodes are very close to 100% pure.
+
+Based on the tree that results, suggest a “nature guide” that tells people which mushrooms are safe to eat and which aren’t.
+
+Nature Guide:
+
+- First, check if your mushroom smells like creosote, fishy, foul, musty, pungent, or spicy. If any of these scents are present, don’t eat it, it’s poisonous!
+
+- Next, check the spore print color. If it’s green or brown, don’t eat it!
+
+If you’ve made it through those two checks, you only have a 1% chance of eating a poisonous mushroom.
+
+### Part Two: … or is it?
+
+Before we send people off into the world to each poisonous mushrooms, we want to be confident of our guidelines. The decision tree in Q1 may achieve perfection on the data it is fit to, but do we believe these guidelines will hold for future data?
+
+Apply each of the following resampling and/or ensemble techniques to this classification problem. For each, make an argument from the results.
+
+You should either argue that
+
+1. The classification rules we learned in Part One probably apply to all mushrooms; or
+
+2. The classification rules we learned in Part One are overfit to this particular sample of mushrooms and/or set off predictors.
+
+#### Q1: Cross-validation
+
+```{r}
+mush_wflow <- workflow() %>%
+  add_model(tree_mod) %>%
+  add_recipe(mushrooms_recipe)
+
+mush_cv <- vfold_cv(mushrooms, 5)
+
+mush_wflow %>%
+  fit_resamples(mush_cv) %>%
+  collect_metrics()
+```
+
+- After cross-validation we still have a 99% accuracy, meaning we have not overtfit out decision tree to this dataset.
+
+#### Q2: Bagging
+
+```{r}
+bag_mod <- bag_tree() %>%
+  set_engine("rpart", times = 10) %>%
+  set_mode("classification")
+
+mush_bag_wflow <- workflow() %>%
+  add_model(bag_mod) %>%
+  add_recipe(mushrooms_recipe)
+
+mush_bag_fit <- mush_bag_wflow %>%
+  fit(mushrooms) 
+
+mushrooms %>%
+  mutate(
+    preds = predict(mush_bag_fit, mushrooms)$.pred_class
+  ) %>%
+  metrics(truth = class,
+          estimate = preds)
+```
+
+- After bagging we get 100% accuracy. This makes sense since if we can sort a dataset with 99% accuracy then we should be able to sort a sub sample of that dataset perfectly. This further proves that our decision tree was not over fit to mushrooms dataset.
+
+#### Q3: Random forests
+
+```{r}
+mtry_grid <- grid_regular(mtry(c(1, 15)), levels = 5)
+
+rf_mod <- rand_forest(mtry = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+mush_rf_wflow <- workflow() %>%
+  add_model(rf_mod) %>%
+  add_recipe(mushrooms_recipe)
+
+mush_rf_fit <- mush_rf_wflow %>%
+  tune_grid(
+    grid = mtry_grid,
+    resamples = mush_cv
+    ) 
+
+mush_rf_fit %>% collect_metrics()
+```
+
+- Random Forests give us perfect accuracy as long as more than one variable is used per tree. This further enhances the decision tree model since it shows that high accuracy of our initial model did not depend on any particular variable.
+
+#### Q4: Neural networks
+
+```{r}
+mush_bag_fit <- mush_bag_wflow %>%
+  fit(mushrooms) 
+
+mushrooms %>%
+  mutate(
+    preds = predict(mush_bag_fit, mushrooms)$.pred_class
+  ) %>%
+  metrics(truth = class,
+          estimate = preds)
+```
+```{r}
+mushrooms_recipe2 <- recipe(class ~ ., 
+                     data = mushrooms) %>% 
+  step_dummy(all_nominal_predictors())
+```
+
+
+```{r}
+nn_mod <- mlp(
+  hidden_units = tune(),
+  penalty = tune(),
+  epochs = 10,
+  activation = "linear"
+) %>%
+  set_engine("keras") %>%
+  set_mode("classification")
+
+nn_wflow <- workflow() %>%
+  add_recipe(mushrooms_recipe2) %>%
+  add_model(nn_mod)
+
+nn_grid <- grid_regular(
+  hidden_units(c(2, 8)),
+  penalty(c(-5, 0)),
+  levels = 2
+)
+
+nn_grid_search <-
+  tune_grid(
+    nn_wflow,
+    resamples = mush_cv,
+    grid = nn_grid
+  )
+
+tuning_metrics <- nn_grid_search %>%
+  collect_metrics()
+
+tuning_metrics
+```
+
+- The neural network model is a very good model for this dataset. This model further confirms that the predictor variables do a good job classifying whether a mushroom is poisonous or not.
+
+### Part Three: Logistic Regression
+
+Fit a logistic regression, including only the predictors that you deem most important based on your work in Parts One and Two.
+
+```{r}
+lr_mod <- logistic_reg() %>% 
+  set_engine('glm') %>% 
+  set_mode('classification')
+
+lr_mod %>% 
+  fit(class ~ odor + spore_print_color, mushrooms) %$%
+  fit %>% summary()
+```
+
+Interpret the results: which features of a mushroom are most indicative of poisonness?
+
+- We get a warning stating that that some probabilities are 0 or 1 basically meaning that we cannot estimate the log odds of events that have already been categorized.
+
+## Dataset 2: Telecom Customers
+
+Congratulations! You have been hired by the Data Science division of a major telecommunication company.
+
+The Sales division of the company wants to understand how customer demographics - such as their age, income, marital status, employment status, etc - impact the customer’s behavior. They have identified four different types of customers, and labeled a dataset of existing customers with these categories.
+
+```{r}
+tele <- read_csv("https://www.dropbox.com/s/9dymy30v394ud8h/Telecust1.csv?dl=1")
+```
+
+```{r}
+tele <- tele %>% 
+  mutate(region = as.factor(region),
+         marital = as.factor(marital),
+         ed = as.factor(ed),
+         retire = as.factor(retire),
+         gender = as.factor(gender),
+         reside = as.factor(reside),
+         custcat = as.factor(custcat))
+```
+
+Further documentation of this data can be found here: https://www.kaggle.com/prathamtripathi/customersegmentation
+
+##### Pre PLotting
+
+```{r}
+tele %>% 
+  ggplot(aes(x=custcat, y= region)) + geom_boxplot()
+
+tele %>% 
+  ggplot(aes(x=custcat, y= tenure)) + geom_boxplot()
+
+tele %>% 
+  ggplot(aes(x=custcat, y= age)) + geom_boxplot()
+
+tele %>% 
+  ggplot(aes(x=custcat, y= income)) + geom_boxplot()
+
+tele %>% 
+  ggplot(aes(x=custcat, y= marital)) + geom_boxplot()
+
+tele %>% 
+  ggplot(aes(x=custcat, y= address)) + geom_boxplot()
+
+tele %>% 
+  ggplot(aes(x=custcat, y= ed)) + geom_boxplot()
+
+tele %>% 
+  ggplot(aes(x=custcat, y= employ)) + geom_boxplot()
+
+tele %>% 
+  ggplot(aes(x=custcat, y= retire)) + geom_boxplot()
+
+tele %>% 
+  ggplot(aes(x=custcat, y= gender)) + geom_boxplot()
+
+tele %>% 
+  ggplot(aes(x=custcat, y= reside)) + geom_boxplot()
+
+```
+
+##### Correlation Heatmap
+
+```{r}
+model.matrix(~0+., data=tele) %>% 
+  cor(use="pairwise.complete.obs") %>% 
+  ggcorrplot(show.diag = F, type="lower", lab=TRUE, lab_size=1) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 8)) +
+  theme(axis.text.y = element_text(size = 8))
+```
+
+You’ve been tasked with studying the customer demographics and customer categories. The company would like two results from you:
+
+1. A model that can be used to predict what category a new customer who signs up will likely fall into.
+
+##### Cross Validation and Recipes
+
+```{r}
+tele_cvs <- vfold_cv(tele, v = 10)
+
+tele_recipe1 <- recipe(custcat ~ ., 
+                     data = tele) %>% 
+  step_normalize(all_numeric()) %>%
+  step_dummy(all_nominal(), -custcat)
+
+tele_recipe2 <- recipe(custcat ~ tenure + age + income + marital + ed + address + employ + retire +gender, 
+                     data = tele) %>% 
+  step_normalize(all_numeric()) %>%
+  step_dummy(all_nominal(), -custcat)
+
+tele_recipe3 <- recipe(custcat ~ region + tenure  + income + ed, 
+                     data = tele) %>% 
+  step_normalize(all_numeric()) %>%
+  step_dummy(all_nominal(), -custcat)
+```
+
+##### Random Forests 1
+
+```{r}
+tele_mtry_grid <- grid_regular(mtry(c(1, 10)), levels = 5)
+
+tele_rf_mod <- rand_forest(mtry = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+tele_rf_wflow <- workflow() %>%
+  add_model(tele_rf_mod) %>%
+  add_recipe(tele_recipe1)
+
+tele_rf_fit <- tele_rf_wflow %>%
+  tune_grid(
+    grid = tele_mtry_grid,
+    resamples = tele_cvs
+    ) 
+
+tele_tuning <- tele_rf_fit %>% collect_metrics()
+
+tele_tuning %>% 
+  arrange(desc(mean))
+```
+
+##### Random Forests 2
+
+```{r}
+tele_mtry_grid <- grid_regular(mtry(c(1, 10)), levels = 5)
+
+tele_rf_mod <- rand_forest(mtry = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+tele_rf_wflow <- workflow() %>%
+  add_model(tele_rf_mod) %>%
+  add_recipe(tele_recipe2)
+
+tele_rf_fit <- tele_rf_wflow %>%
+  tune_grid(
+    grid = tele_mtry_grid,
+    resamples = tele_cvs
+    ) 
+
+tele_tuning <- tele_rf_fit %>% collect_metrics()
+
+tele_tuning %>% 
+  arrange(desc(mean))
+```
+
+##### Random Forests 3
+
+```{r}
+tele_mtry_grid <- grid_regular(mtry(c(1, 10)), levels = 5)
+
+tele_rf_mod <- rand_forest(mtry = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+tele_rf_wflow <- workflow() %>%
+  add_model(tele_rf_mod) %>%
+  add_recipe(tele_recipe3)
+
+tele_rf_fit <- tele_rf_wflow %>%
+  tune_grid(
+    grid = tele_mtry_grid,
+    resamples = tele_cvs
+    ) 
+
+tele_tuning <- tele_rf_fit %>% collect_metrics()
+
+tele_tuning %>% 
+  arrange(desc(mean))
+```
+- Random Forests were a horrible model for this dataset.
+
+##### Decision Tree 1 
+
+```{r}
+tele_tree_grid <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          min_n(), 
+                          levels = 2)
+
+tele_tree_mod <- decision_tree(cost_complexity = tune(),
+                          tree_depth = tune(),
+                          min_n = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+tele_tree_wflow <- workflow() %>%
+  add_recipe(tele_recipe1) %>%
+  add_model(tele_tree_mod)
+
+tree_grid_search <-
+  tune_grid(
+    tele_tree_wflow,
+    resamples = tele_cvs,
+    grid = tele_tree_grid
+  )
+tuning_metrics <- tree_grid_search %>% collect_metrics()
+
+tuning_metrics %>% 
+  arrange(desc(mean))
+```
+
+##### Decision Tree 2
+
+```{r}
+tele_tree_grid <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          min_n(), 
+                          levels = 2)
+
+tele_tree_mod <- decision_tree(cost_complexity = tune(),
+                          tree_depth = tune(),
+                          min_n = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+tele_tree_wflow <- workflow() %>%
+  add_recipe(tele_recipe2) %>%
+  add_model(tele_tree_mod)
+
+tree_grid_search <-
+  tune_grid(
+    tele_tree_wflow,
+    resamples = tele_cvs,
+    grid = tele_tree_grid
+  )
+tuning_metrics <- tree_grid_search %>% collect_metrics()
+
+tuning_metrics %>% 
+  arrange(desc(mean))
+```
+
+##### Decision Tree 3
+
+```{r}
+tele_tree_grid <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          min_n(), 
+                          levels = 2)
+
+tele_tree_mod <- decision_tree(cost_complexity = tune(),
+                          tree_depth = tune(),
+                          min_n = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+tele_tree_wflow <- workflow() %>%
+  add_recipe(tele_recipe3) %>%
+  add_model(tele_tree_mod)
+
+tree_grid_search <-
+  tune_grid(
+    tele_tree_wflow,
+    resamples = tele_cvs,
+    grid = tele_tree_grid
+  )
+tuning_metrics <- tree_grid_search %>% collect_metrics()
+
+tuning_metrics %>% 
+  arrange(desc(mean))
+```
+
+-Decision trees were worse than random forests and also a horrible model for this dataset.
+
+##### KNN1
+
+```{r}
+knn_spec <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+k_grid <- grid_regular(neighbors(c(2, 40)), levels = 10)
+set.seed(10)
+
+knn_wflow <- workflow() %>%
+  add_model(knn_spec) %>%
+  add_recipe(tele_recipe1) 
+
+knn_wflow %>%
+  tune_grid(
+    grid = k_grid,
+    resamples = tele_cvs
+  ) %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  arrange(desc(mean))
+```
+
+##### KNN2
+
+```{r}
+knn_spec <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+k_grid <- grid_regular(neighbors(c(2, 40)), levels = 10)
+set.seed(10)
+
+knn_wflow <- workflow() %>%
+  add_model(knn_spec) %>%
+  add_recipe(tele_recipe2) 
+
+knn_wflow %>%
+  tune_grid(
+    grid = k_grid,
+    resamples = tele_cvs
+  ) %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  arrange(desc(mean))
+```
+
+##### KNN3
+
+```{r}
+knn_spec <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+k_grid <- grid_regular(neighbors(c(2, 40)), levels = 10)
+set.seed(10)
+
+knn_wflow <- workflow() %>%
+  add_model(knn_spec) %>%
+  add_recipe(tele_recipe3) 
+
+knn_wflow %>%
+  tune_grid(
+    grid = k_grid,
+    resamples = tele_cvs
+  ) %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  arrange(desc(mean))
+```
+
+- KNN was just as if not worse than the previous models. 
+
+2. Insight into what demographics are associated with these customer differences.
+
+```{r}
+tree_grid <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          min_n(), 
+                          levels = 2)
+
+tele_recipe2x <- recipe(custcat ~ ., 
+                     data = tele, importance = TRUE) 
+  
+```
+
+
+```{r}
+tele_rf_mod <- rand_forest(
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger") %>%
+  set_mode("classification") 
+
+tele_rf_wflow <- workflow() %>%
+  add_recipe(tele_recipe2x) %>%
+  add_model(tele_rf_mod)
+
+grid_search <- 
+  tune_grid(
+    tele_rf_wflow,
+    resamples = tele_cvs,
+    grid = 25,
+    control = control_grid(save_pred = TRUE)
+  )
+
+tuning_metrics <- grid_search %>% collect_metrics
+
+tuning_metrics %>% 
+  arrange(desc(mean))
+ 
+```
+
+```{r}
+splits <- initial_split(tele)
+
+last_rf_mod <- 
+  rand_forest(mtry = 8, min_n = 39, trees = 871 ) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+
+# the last workflow
+last_rf_workflow <- 
+  tele_rf_wflow %>% 
+  update_model(last_rf_mod)
+
+# the last fit
+set.seed(345)
+last_rf_fit <- 
+  last_rf_workflow %>% 
+  last_fit(splits)
+
+last_rf_fit
+
+last_rf_fit %>% 
+  collect_metrics()
+```
+
+```{r}
+last_rf_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip(num_features = 11)
+```
+
+### Part Four: Report to your manager
+
+Your manager, the head of the Data Science department, would like a summary of your work.
+
+She does not need to see every single detail of every step of your process, but she does need to know a basic outline of what you tried, how you made your decisions, and why you settled on certain choices.
+
+You should share only as much of your code and results as you feel is necessary for her to get the “big picture” of your approach. You can assume she has taken our course, and you may use any “lingo” you want; for example, you can reference the Gini Index without having to explain what it is.
+
+- In order to understand how customer demographics impact consumer behavior the first step was to load and clean the data. 
+
+```{r}
+tele <- read_csv("https://www.dropbox.com/s/9dymy30v394ud8h/Telecust1.csv?dl=1")
+```
+
+Cleaning the data just meant converting certain variables to factors. 
+
+```{r}
+tele <- tele %>% 
+  mutate(region = as.factor(region),
+         marital = as.factor(marital),
+         ed = as.factor(ed),
+         retire = as.factor(retire),
+         gender = as.factor(gender),
+         reside = as.factor(reside),
+         custcat = as.factor(custcat))
+```
+
+Next, I wanted to explore the dataset further, so I plotted all the predictor variables against consumer behavior (custcat) in the form of box plots. One example of this process is as follows.
+
+```{r}
+tele %>% 
+  ggplot(aes(x=custcat, y= region)) + geom_boxplot()
+```
+
+Furthermore, I also produced a heatmap showing correlation between variables. 
+
+```{r}
+model.matrix(~0+., data=tele) %>% 
+  cor(use="pairwise.complete.obs") %>% 
+  ggcorrplot(show.diag = F, type="lower", lab=TRUE, lab_size=1) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 8)) +
+  theme(axis.text.y = element_text(size = 8))
+```
+
+All this was done, in order to develop strong recipes of success as we now know better how and which predictor variables impacted consumer behavior best. After conducting a short exploratory data analysis, a cross validation sample was set up to fit on future models.
+
+```{r}
+tele_cvs <- vfold_cv(tele, v = 10)
+```
+
+Next, using the EDA, 3 recipes were created. All the recipes were normalized and dummified. Starting with all the predictor variables in the dataset in recipe 1, I narrowed down the predictor variables in recipe 2 and 3 using information from the EDA to select the most important predictor variables.
+
+```{r}
+tele_recipe1 <- recipe(custcat ~ ., 
+                     data = tele) %>% 
+  step_normalize(all_numeric()) %>%
+  step_dummy(all_nominal(), -custcat)
+
+tele_recipe2 <- recipe(custcat ~ tenure + age + income + marital + ed + address + employ + retire +gender, 
+                     data = tele) %>% 
+  step_normalize(all_numeric()) %>%
+  step_dummy(all_nominal(), -custcat)
+
+tele_recipe3 <- recipe(custcat ~ region + tenure  + income + ed, 
+                     data = tele) %>% 
+  step_normalize(all_numeric()) %>%
+  step_dummy(all_nominal(), -custcat)
+```
+
+Once, cross-validation and the recipes were set up, I created multiple models using multiple algorithms such as random forests, decision trees and KNN for each recipe and fit them to the cross-validated dataset. For each model/algorithm, I got an accuracy of between 35%-40%, with recipe 2 with a random forests algorithm outperforming every other model consistently.
+
+```{r}
+tele_mtry_grid <- grid_regular(mtry(c(1, 10)), levels = 5)
+
+tele_rf_mod <- rand_forest(mtry = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+tele_rf_wflow <- workflow() %>%
+  add_model(tele_rf_mod) %>%
+  add_recipe(tele_recipe2)
+
+tele_rf_fit <- tele_rf_wflow %>%
+  tune_grid(
+    grid = tele_mtry_grid,
+    resamples = tele_cvs
+    ) 
+
+tele_tuning <- tele_rf_fit %>% collect_metrics()
+
+tele_tuning %>% 
+  arrange(desc(mean))
+```
+
+Here, as one can see, I got an accuracy of about 39%, which even though is considered low, is pretty good for such an analysis since if we were to split customers into categories at random, we would have an average accuracy of around 25%, showing that our model is better than random chance alone.
+
+Next, I wanted to get better insights on how the demographics are associated with customer differences. To do so, I created VIP plot using random forests. Since, I wanted to look at all the demographics/predictor variables, I changed the recipe accordingly to create the chart. 
+
+```{r}
+last_rf_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip(num_features = 11)
+```
+
+As one can see from the results, tenure, income and educations seem to be the most important demographics impacting customer differences.
